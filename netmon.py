@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════╗
-║           NETMON  v1.0               ║
-║  Network Monitor — dual endpoint     ║
-╚══════════════════════════════════════╝
-"""
+"""netmon — Network Monitor for Termux / narrow terminals"""
 
 import subprocess
 import threading
@@ -17,357 +12,244 @@ import argparse
 from datetime import datetime
 from collections import deque
 
-# ─── ANSI Colors & Styles ───────────────────────────────────────────────────
-RESET   = "\033[0m"
-BOLD    = "\033[1m"
-DIM     = "\033[2m"
+# ─── ANSI ───────────────────────────────────────────────────────────────────
+R  = "\033[0m"
+B  = "\033[1m"
+D  = "\033[2m"
+RD = "\033[91m"
+GR = "\033[92m"
+YL = "\033[93m"
+CY = "\033[96m"
+MG = "\033[95m"
+WH = "\033[97m"
 
-RED     = "\033[91m"
-GREEN   = "\033[92m"
-YELLOW  = "\033[93m"
-BLUE    = "\033[94m"
-MAGENTA = "\033[95m"
-CYAN    = "\033[96m"
-WHITE   = "\033[97m"
-ORANGE  = "\033[38;5;208m"
+def clear():
+    os.system('clear')
 
-BG_DARK = "\033[48;5;235m"
-BG_BLUE = "\033[48;5;17m"
+def hide_cursor():  sys.stdout.write("\033[?25l"); sys.stdout.flush()
+def show_cursor():  sys.stdout.write("\033[?25h"); sys.stdout.flush()
+def goto(r, c):     sys.stdout.write(f"\033[{r};{c}H")
 
-def clear_screen():
-    os.system('cls' if platform.system() == 'Windows' else 'clear')
+def term_width():
+    try:    return os.get_terminal_size().columns
+    except: return 40
 
-def hide_cursor():
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-
-def show_cursor():
-    sys.stdout.write("\033[?25h")
-    sys.stdout.flush()
-
-def move_cursor(row, col):
-    sys.stdout.write(f"\033[{row};{col}H")
-
-def get_terminal_size():
+# ─── Ping ────────────────────────────────────────────────────────────────────
+def do_ping(host, timeout=2):
+    is_win = platform.system() == "Windows"
+    cmd = (["ping", "-n", "1", "-w", str(timeout*1000), host] if is_win
+           else ["ping", "-c", "1", "-W", str(timeout), host])
     try:
-        size = os.get_terminal_size()
-        return size.columns, size.lines
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+2)
+        out = r.stdout + r.stderr
+        for pat in [r"time[=<]([\d.]+)\s*ms", r"avg.*?=([\d.]+)/", r"Average = ([\d.]+)ms"]:
+            m = re.search(pat, out, re.IGNORECASE)
+            if m:
+                return True, float(m.group(1))
+        return (r.returncode == 0), 0.0
     except:
-        return 80, 24
-
-# ─── Ping Logic ─────────────────────────────────────────────────────────────
-def do_ping(host, count=1, timeout=2):
-    """Execute a single ping and return (success, latency_ms)."""
-    system = platform.system()
-
-    if system == "Windows":
-        cmd = ["ping", "-n", str(count), "-w", str(timeout * 1000), host]
-    else:
-        cmd = ["ping", "-c", str(count), "-W", str(timeout), host]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 2
-        )
-        output = result.stdout + result.stderr
-
-        patterns = [
-            r"time[=<]([\d.]+)\s*ms",
-            r"avg.*?=([\d.]+)/",
-            r"Average = ([\d.]+)ms",
-        ]
-        for pat in patterns:
-            match = re.search(pat, output, re.IGNORECASE)
-            if match:
-                return True, float(match.group(1))
-
-        if result.returncode == 0:
-            return True, 0.0
         return False, None
 
-    except subprocess.TimeoutExpired:
-        return False, None
-    except Exception:
-        return False, None
-
-# ─── Endpoint State ──────────────────────────────────────────────────────────
+# ─── Endpoint ────────────────────────────────────────────────────────────────
 class Endpoint:
-    def __init__(self, name, host, color, symbol):
-        self.name    = name
-        self.host    = host
-        self.color   = color
-        self.symbol  = symbol
-        self.alive   = None
-        self.latency = None
-        self.sent    = 0
-        self.recv    = 0
-        self.history   = deque(maxlen=20)
-        self.latencies = deque(maxlen=20)
-        self.last_ping_time = None
+    def __init__(self, name, host, color):
+        self.name      = name
+        self.host      = host
+        self.color     = color
+        self.alive     = None
+        self.latency   = None
+        self.sent      = 0
+        self.recv      = 0
+        self.history   = deque(maxlen=14)
+        self.latencies = deque(maxlen=10)
+        self.ts        = None
 
     @property
     def loss_pct(self):
-        if self.sent == 0:
-            return 0.0
-        return 100.0 * (self.sent - self.recv) / self.sent
+        return 0.0 if self.sent == 0 else 100*(self.sent-self.recv)/self.sent
 
     @property
-    def avg_latency(self):
-        vals = [v for v in self.latencies if v is not None]
-        return sum(vals) / len(vals) if vals else None
+    def avg_ms(self):
+        v = [x for x in self.latencies if x]
+        return sum(v)/len(v) if v else None
 
     @property
-    def status_color(self):
-        if self.alive is None:
-            return DIM + WHITE
-        if self.alive:
-            return YELLOW if (self.latency and self.latency > 150) else GREEN
-        return RED
+    def sc(self):
+        if self.alive is None: return D+WH
+        if self.alive: return YL if (self.latency and self.latency > 150) else GR
+        return RD
 
-    @property
-    def status_text(self):
-        if self.alive is None:
-            return "CHECKING..."
-        if self.alive:
-            return f"ONLINE  {self.latency:.1f}ms" if self.latency else "ONLINE"
-        return "OFFLINE"
-
-# ─── Monitor Thread ──────────────────────────────────────────────────────────
-def monitor_worker(endpoint: Endpoint, interval: float, stop_event: threading.Event):
-    while not stop_event.is_set():
-        start = time.time()
-        success, latency = do_ping(endpoint.host)
-
-        endpoint.sent += 1
-        endpoint.alive = success
-        endpoint.last_ping_time = datetime.now()
-
-        if success:
-            endpoint.recv += 1
-            endpoint.latency = latency
-            endpoint.latencies.append(latency)
+def monitor_worker(ep, interval, stop):
+    while not stop.is_set():
+        t0 = time.time()
+        ok, ms = do_ping(ep.host)
+        ep.sent += 1
+        ep.alive = ok
+        ep.ts = datetime.now()
+        if ok:
+            ep.recv += 1
+            ep.latency = ms
+            ep.latencies.append(ms)
         else:
-            endpoint.latency = None
-            endpoint.latencies.append(None)
-
-        endpoint.history.append(success)
-
-        elapsed = time.time() - start
-        stop_event.wait(max(0, interval - elapsed))
+            ep.latency = None
+            ep.latencies.append(None)
+        ep.history.append(ok)
+        stop.wait(max(0, interval - (time.time()-t0)))
 
 # ─── Packet Animation ────────────────────────────────────────────────────────
-class PacketAnimation:
-    """Animates packets traveling between two endpoints."""
+class Anim:
     def __init__(self):
-        self.packets = []
+        self.pkts = []
         self.lock = threading.Lock()
 
-    def spawn(self, direction, color):
+    def spawn(self, color):
         with self.lock:
-            self.packets.append({
-                "pos": 0.0,
-                "direction": direction,  # 1 = A→B, -1 = B→A
-                "color": color,
-                "age": 0,
-            })
+            self.pkts.append({"pos": 0.0, "color": color})
 
-    def update(self, dt, speed=1.0):
+    def update(self, dt, speed=0.35):
         with self.lock:
-            for p in self.packets:
-                p["pos"] += dt * speed * p["direction"]
-                p["age"] += dt
-            self.packets = [p for p in self.packets if 0.0 <= p["pos"] <= 1.0]
+            for p in self.pkts:
+                p["pos"] = min(1.0, p["pos"] + dt * speed)
+            self.pkts = [p for p in self.pkts if p["pos"] < 1.0]
 
-    def get_packets(self):
-        with self.lock:
-            return list(self.packets)
+    def get(self):
+        with self.lock: return list(self.pkts)
 
-# ─── Renderer ────────────────────────────────────────────────────────────────
-def latency_bar(value, max_val=200, width=10):
-    if value is None:
-        return DIM + "─" * width + RESET
-    ratio = min(value / max_val, 1.0)
-    filled = int(ratio * width)
-    color = GREEN if ratio < 0.3 else (YELLOW if ratio < 0.7 else RED)
-    return color + "█" * filled + DIM + "░" * (width - filled) + RESET
+# ─── Render helpers ──────────────────────────────────────────────────────────
+def sparkline(history, w):
+    buf = list(history)
+    while len(buf) < w: buf.insert(0, None)
+    buf = buf[-w:]
+    out = ""
+    for h in buf:
+        if h is True:    out += GR + "█" + R
+        elif h is False: out += RD + "░" + R
+        else:            out += D  + "─" + R
+    return out
 
-def history_sparkline(history, width=20):
-    chars = {True: GREEN + "▄" + RESET, False: RED + "▄" + RESET, None: DIM + "─" + RESET}
-    hist = list(history)
-    while len(hist) < width:
-        hist.insert(0, None)
-    return "".join(chars[h] for h in hist[-width:])
+def latbar(val, w=10):
+    if val is None: return D + "─"*w + R
+    ratio = min(val/200, 1.0)
+    f = int(ratio * w)
+    c = GR if ratio < 0.3 else (YL if ratio < 0.7 else RD)
+    return c + "▓"*f + D + "░"*(w-f) + R
 
-def render(ep_a: Endpoint, ep_b: Endpoint, anim: PacketAnimation, frame: int, width: int, height: int):
+def tunnel_line(pkts, w):
+    cells = [D+"·"+R] * w
+    for p in pkts:
+        idx = max(0, min(w-1, int(p["pos"] * (w-1))))
+        cells[idx] = B + p["color"] + "●" + R
+    return "".join(cells)
+
+def vis(s):
+    return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+def padto(s, w):
+    return s + " " * max(0, w - vis(s))
+
+# ─── Main render ─────────────────────────────────────────────────────────────
+def render(ep_a, ep_b, anim, interval):
+    W = term_width()
+    now = datetime.now().strftime("%H:%M:%S")
     lines = []
 
-    # ── Header ──────────────────────────────────────────────────────────────
-    title = "  ◈  NETMON — Network Monitor  ◈  "
-    ts    = datetime.now().strftime("%H:%M:%S")
-    pad   = max(0, width - len(title) - len(ts) - 2)
-    lines.append(BOLD + CYAN + title + RESET + DIM + " " * pad + ts + RESET)
-    lines.append(DIM + "─" * width + RESET)
+    # Header
+    title = B+CY+"◈ NETMON"+R
+    lines.append(padto(title, W-8) + D+now+R)
+    lines.append(D+"─"*W+R)
+
+    def ep_block(ep):
+        sc = ep.sc
+        lines.append(f" {B}{ep.color}{ep.name}{R}  {D}{ep.host}{R}")
+
+        if ep.alive is None:
+            status = D+"…checking"+R
+        elif ep.alive:
+            lat = f"{ep.latency:.0f}ms" if ep.latency else "ok"
+            status = sc+B+"▲ UP"+R+"  "+sc+lat+R
+        else:
+            status = sc+B+"▼ DOWN"+R
+
+        avg = ep.avg_ms
+        avg_str = (sc+f"{avg:.0f}ms"+R) if avg else D+"--"+R
+        lines.append(f" {status}   avg:{avg_str}")
+        lines.append(f" {latbar(ep.avg_ms, W-4)}")
+
+        loss_c = RD if ep.loss_pct > 5 else D
+        ts_str = ep.ts.strftime("%H:%M:%S") if ep.ts else "--:--:--"
+        lines.append(f" {GR}↑{ep.sent}{R} {CY}↓{ep.recv}{R}  {loss_c}loss:{ep.loss_pct:.0f}%{R}  {D}{ts_str}{R}")
+        lines.append(f" {sparkline(ep.history, W-4)}")
+
+    ep_block(ep_a)
     lines.append("")
 
-    # ── Endpoint Boxes ──────────────────────────────────────────────────────
-    box_w = 28
-
-    def endpoint_box(ep: Endpoint):
-        sc = ep.status_color
-        avg = ep.avg_latency
-        return [
-            BOLD + ep.color + f"  {ep.symbol}  {ep.name:<18}" + RESET,
-            DIM + "  HOST: " + RESET + f"{ep.host}",
-            f"  STATUS: {sc}{BOLD}{ep.status_text:<20}{RESET}",
-            f"  AVG:    {latency_bar(avg, width=10)} " + (f"{avg:.1f}ms" if avg else " N/A  "),
-            f"  PKTS:   " + GREEN + f"↑{ep.sent}" + RESET + "  " + CYAN + f"↓{ep.recv}" + RESET +
-            "  " + (RED if ep.loss_pct > 5 else DIM) + f"loss:{ep.loss_pct:.0f}%" + RESET,
-            f"  HIST:   {history_sparkline(ep.history, 18)}",
-        ]
-
-    rows_a = endpoint_box(ep_a)
-    rows_b = endpoint_box(ep_b)
-
-    # ── Tunnel visualization ─────────────────────────────────────────────────
-    tunnel_w = max(width - (box_w * 2) - 4, 10)
-
-    packets = anim.get_packets()
-    tunnel_chars  = [" "] * tunnel_w
-    tunnel_colors = [""] * tunnel_w
-
-    for p in packets:
-        idx = max(0, min(tunnel_w - 1, int(p["pos"] * (tunnel_w - 1))))
-        tunnel_chars[idx]  = "●"
-        tunnel_colors[idx] = p["color"]
-
-    def build_tunnel_line():
-        parts = []
-        for i in range(tunnel_w):
-            if tunnel_colors[i]:
-                parts.append(BOLD + tunnel_colors[i] + tunnel_chars[i] + RESET)
-            else:
-                parts.append(DIM + "·" + RESET)
-        return "".join(parts)
-
-    tunnel_rows = [
-        DIM + "  " + "─" * tunnel_w + "  " + RESET,
-        "  " + build_tunnel_line() + "  ",
-        DIM + "  " + "─" * tunnel_w + "  " + RESET,
-    ]
-    dir_line = GREEN + "  A→B" + " " * (tunnel_w - 8) + "B→A  " + RESET
-
-    def vis_len(s):
-        return len(re.sub(r'\033\[[0-9;]*m', '', s))
-
-    for i in range(max(len(rows_a), len(rows_b))):
-        left  = rows_a[i] if i < len(rows_a) else ""
-        right = rows_b[i] if i < len(rows_b) else ""
-        left_pad = left + " " * (box_w - vis_len(left))
-
-        if   i == 0: mid = dir_line
-        elif i == 1: mid = tunnel_rows[0]
-        elif i == 2: mid = tunnel_rows[1]
-        elif i == 3: mid = tunnel_rows[2]
-        else:        mid = " " * (tunnel_w + 4)
-
-        lines.append(left_pad + mid + right)
-
+    # Tunnel
+    tw = W - 2
+    pkts = anim.get()
+    lines.append(" " + tunnel_line(pkts, tw))
+    mid = tw // 2 - 1
+    lines.append(D + " A" + "─"*mid + "↕" + "─"*(tw - mid - 3) + "B" + R)
     lines.append("")
 
-    # ── Status Log ──────────────────────────────────────────────────────────
-    lines.append(DIM + "─" * width + RESET)
-
-    def status_line(ep: Endpoint, arrow: str):
-        t   = ep.last_ping_time.strftime("%H:%M:%S") if ep.last_ping_time else "--:--:--"
-        sc  = ep.status_color
-        lat = f"{ep.latency:.1f}ms" if ep.latency else "timeout"
-        icon = "✓" if ep.alive else "✗"
-        return (DIM + f" [{t}]  " + RESET +
-                ep.color + BOLD + f"{ep.name:<12}" + RESET +
-                f"  {arrow}  " +
-                sc + BOLD + f"{icon} {lat:<12}" + RESET +
-                DIM + f"  pkt:{ep.sent}/{ep.recv}" + RESET)
-
-    lines.append(status_line(ep_a, "──→"))
-    lines.append(status_line(ep_b, "←──"))
+    ep_block(ep_b)
     lines.append("")
-    lines.append(DIM + f" Ctrl+C to stop  |  interval: {INTERVAL}s  |  frame: {frame}" + RESET)
+    lines.append(D + f" interval:{interval}s  ^C stop" + R)
 
     return lines
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-INTERVAL = 2.0
-
 def main():
-    global INTERVAL
-
-    parser = argparse.ArgumentParser(
-        prog="netmon",
-        description="NETMON — Monitor konektivitas dua endpoint secara real-time"
-    )
-    parser.add_argument("host_a", nargs="?", default="8.8.8.8",
-                        help="Host/IP endpoint A (default: 8.8.8.8)")
-    parser.add_argument("host_b", nargs="?", default="1.1.1.1",
-                        help="Host/IP endpoint B (default: 1.1.1.1)")
-    parser.add_argument("--name-a",   default=None,  help="Label endpoint A")
-    parser.add_argument("--name-b",   default=None,  help="Label endpoint B")
-    parser.add_argument("--interval", type=float, default=2.0,
-                        help="Interval probe dalam detik (default: 2)")
+    parser = argparse.ArgumentParser(prog="netmon",
+        description="Network Monitor — dual endpoint, Termux-friendly")
+    parser.add_argument("host_a", nargs="?", default="192.168.1.1")
+    parser.add_argument("host_b", nargs="?", default="192.168.1.2")
+    parser.add_argument("--name-a",   default=None)
+    parser.add_argument("--name-b",   default=None)
+    parser.add_argument("--interval", type=float, default=2.0)
     args = parser.parse_args()
 
-    INTERVAL = args.interval
-    ep_a = Endpoint(args.name_a or args.host_a, args.host_a, CYAN,    "◉")
-    ep_b = Endpoint(args.name_b or args.host_b, args.host_b, MAGENTA, "◉")
-    anim = PacketAnimation()
+    ep_a = Endpoint(args.name_a or args.host_a, args.host_a, CY)
+    ep_b = Endpoint(args.name_b or args.host_b, args.host_b, MG)
+    anim = Anim()
 
-    stop_event = threading.Event()
+    stop = threading.Event()
     for ep in (ep_a, ep_b):
-        threading.Thread(target=monitor_worker, args=(ep, INTERVAL, stop_event),
-                         daemon=True).start()
+        threading.Thread(target=monitor_worker,
+                         args=(ep, args.interval, stop), daemon=True).start()
 
     hide_cursor()
-    clear_screen()
+    clear()
 
-    frame      = 0
     last_spawn = time.time()
-    last_anim  = time.time()
+    last_t     = time.time()
 
     try:
         while True:
             now = time.time()
-            dt  = now - last_anim
-            last_anim = now
+            dt  = now - last_t
+            last_t = now
 
-            if now - last_spawn > INTERVAL * 0.5:
-                if ep_a.alive: anim.spawn(1,  CYAN)
-                if ep_b.alive: anim.spawn(-1, MAGENTA)
+            if now - last_spawn > args.interval * 0.5:
+                if ep_a.alive: anim.spawn(CY)
+                if ep_b.alive: anim.spawn(MG)
                 last_spawn = now
 
-            anim.update(dt, speed=0.4)
-
-            width, height = get_terminal_size()
-            lines = render(ep_a, ep_b, anim, frame, width, height)
-
-            move_cursor(1, 1)
+            anim.update(dt)
+            lines = render(ep_a, ep_b, anim, args.interval)
+            goto(1, 1)
             sys.stdout.write("\n".join(lines))
             sys.stdout.flush()
-
-            frame += 1
-            time.sleep(0.1)
+            time.sleep(0.12)
 
     except KeyboardInterrupt:
         pass
     finally:
-        stop_event.set()
+        stop.set()
         show_cursor()
-        clear_screen()
-        print(f"\n{CYAN}netmon dihentikan.{RESET}")
+        clear()
+        print(f"\n{CY}netmon stopped.{R}")
         for ep in (ep_a, ep_b):
-            print(f"  {ep.color}{ep.name}{RESET}: "
-                  f"sent={ep.sent}  recv={ep.recv}  loss={ep.loss_pct:.1f}%")
+            print(f"  {ep.color}{ep.name}{R}  sent={ep.sent} recv={ep.recv} loss={ep.loss_pct:.0f}%")
         print()
 
 if __name__ == "__main__":
